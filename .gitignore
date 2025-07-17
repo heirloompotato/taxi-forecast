@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment variables
+.env
+.env.*
+*.env
+.venv
+env/
+venv/
+ENV/
+
+# Credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+credentials.json
+*credential*
+*secret*
+*token*
+
+# BigQuery & Cloud
+*.bak
+*.dat
+*.bqschema
+
+# Docker
+.docker/
+
+# Logs
+logs/
+*.log
