@@ -1,0 +1,10 @@
+streamlit==1.47.0
+pandas
+plotly==6.2.0
+google-cloud-bigquery
+google-cloud-bigquery-storage
+google-auth
+db-dtypes
+folium
+streamlit-folium
+h3

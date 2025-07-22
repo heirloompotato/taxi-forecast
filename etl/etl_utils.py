@@ -2,9 +2,12 @@ import pandas as pd
 from google.cloud import bigquery, storage
 from io import StringIO
 import logging
-import db_dtypes
-import datetime
 import numpy as np
+import os
+import pickle
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_percentage_error
+from sklearn.preprocessing import OneHotEncoder 
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +27,30 @@ def load_csv_from_gcs(bucket_name, blob_name):
         logging.error(f"INCIDENT: Failed to load {blob_name} from {bucket_name}: {e}")
         raise
 
+def load_model_from_gcs(bucket_name, model_path="models/xgboost_model_2h.pkl"):
+    """Load the XGBoost model from Google Cloud Storage."""
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(model_path)
+        
+        # Download to a temporary file
+        temp_file = "/tmp/temp_model.pkl"
+        blob.download_to_filename(temp_file)
+        
+        # Load the model
+        with open(temp_file, "rb") as f:
+            model = pickle.load(f)
+        
+        # Clean up
+        os.remove(temp_file)
+        
+        logging.info(f"Successfully loaded model from gs://{bucket_name}/{model_path}")
+        return model
+    except Exception as e:
+        logging.error(f"INCIDENT: Failed to load model from GCS: {str(e)}")
+        raise
+
 def ceil_dt_to_5min(dt_series: pd.Series) -> pd.Series:
     """Round up pandas datetime series to the next 5-minute interval."""
     return (dt_series + pd.Timedelta(minutes=4)).dt.floor('5min')
@@ -37,24 +64,56 @@ def join_records_dim(readings_df: pd.DataFrame, taxi_df: pd.DataFrame, forecast_
     """
     Merge readings, taxi, and optionally forecast DataFrames on ['reading_time', 'region'].
     Uses outer join to retain all records.
+    
+    Handles None inputs by returning any available DataFrame.
+    Returns empty DataFrame if all inputs are None.
     """
     try:
+        # Handle cases where inputs may be None
+        if readings_df is None and taxi_df is None and forecast_df is None:
+            logging.warning("All input DataFrames are None. Returning empty DataFrame.")
+            return pd.DataFrame(columns=["reading_time", "region"])
+        
+        # If only one DataFrame is available, return it
+        if readings_df is None and taxi_df is None:
+            logging.warning("readings_df and taxi_df are None. Returning only forecast_df.")
+            return forecast_df
+        elif readings_df is None and forecast_df is None:
+            logging.warning("readings_df and forecast_df are None. Returning only taxi_df.")
+            return taxi_df
+        elif taxi_df is None and forecast_df is None:
+            logging.warning("taxi_df and forecast_df are None. Returning only readings_df.")
+            return readings_df
+        
+        # Handle two-way merges when one DataFrame is None
+        if readings_df is None:
+            logging.warning("readings_df is None. Merging taxi_df and forecast_df.")
+            return pd.merge(taxi_df, forecast_df, on=["reading_time", "region"], how="outer")
+        elif taxi_df is None:
+            logging.warning("taxi_df is None. Merging readings_df and forecast_df.")
+            return pd.merge(readings_df, forecast_df, on=["reading_time", "region"], how="outer")
+        elif forecast_df is None:
+            logging.warning("forecast_df is None. Merging readings_df and taxi_df.")
+            return pd.merge(readings_df, taxi_df, on=["reading_time", "region"], how="outer")
+        
+        # Standard case - all DataFrames available
         final_df = pd.merge(readings_df, taxi_df, on=["reading_time", "region"], how="outer")
-        if forecast_df is not None:
-            final_df = final_df.merge(forecast_df, on=["reading_time", "region"], how="outer")
+        final_df = final_df.merge(forecast_df, on=["reading_time", "region"], how="outer")
         logging.info(f"Merged records shape: {final_df.shape}")
         return final_df
     except Exception as e:
         logging.error(f"INCIDENT: Failed to merge records: {e}")
-        raise
+        # Return empty DataFrame instead of raising
+        logging.warning("Returning empty DataFrame due to merge failure")
+        return pd.DataFrame(columns=["reading_time", "region"])
 
 def pull_recent_data_bq(bq_client: bigquery.Client, table_id: str, cutoff: pd.Timestamp) -> pd.DataFrame:
     """
-    Pulls recent data from BigQuery table from cutoff minus 20 minutes onward.
+    Pulls recent data from BigQuery table from cutoff minus 4 hours onward.
     Uses the BigQuery Storage API if available.
     """
-    # bq_cutoff set to 20 minutes before current cutoff execution time
-    bq_cutoff = (cutoff - pd.Timedelta(minutes=20)).isoformat()
+    # bq_cutoff set to 4 hours before current cutoff execution time
+    bq_cutoff = (cutoff - pd.Timedelta(hours=4)).isoformat()
     try:
         query = f"""
             SELECT * FROM `{table_id}`
@@ -81,34 +140,33 @@ def pull_recent_data_bq(bq_client: bigquery.Client, table_id: str, cutoff: pd.Ti
         raise
 
 def overwrite_recent_values_with_time_regressors(
-    bq_df: pd.DataFrame, new_df: pd.DataFrame, time_dim: pd.DataFrame
+    bq_df: pd.DataFrame, new_df: pd.DataFrame, time_dim: pd.DataFrame, cutoff: pd.Timestamp
 ) -> pd.DataFrame:
     """
     Overwrites non-null values in bq_df using new_df (per-cell basis).
     Clears bq_df values forward from the earliest time a new value appears per column.
     Adds new rows from new_df to bq_df when reading_time is not present.
     Adds time regressors to any newly added rows.
-    Handles empty bq_df gracefully.
+    Ensures the result contains entries for the current cutoff timestamp.
+    
+    Args:
+        bq_df: DataFrame from BigQuery
+        new_df: New DataFrame to merge in
+        time_dim: Time dimension DataFrame with time regressors
+        cutoff: Current timestamp that must be present in the final DataFrame
     """
     try:
         # Make copies to avoid modifying originals
         bq_df = bq_df.copy()
         new_df = new_df.copy()
-        # Replace pd.NA with np.nan in numeric columns to avoid NAType errors
-        for df in [bq_df, new_df]:
-            for col in df.select_dtypes(include=['number']).columns:
-                if pd.isna(df[col]).any():
-                    df[col] = df[col].fillna(np.nan)
 
-        # Check for duplicates in indices before any operations
-        if new_df.duplicated(subset=["reading_time", "region"]).any():
-            logging.warning("Duplicates found in new_df. Taking the last occurrence.")
-            new_df = new_df.drop_duplicates(subset=["reading_time", "region"], keep="last")
-            
-        if bq_df.duplicated(subset=["reading_time", "region"]).any():
-            logging.warning("Duplicates found in bq_df. Taking the last occurrence.")
-            bq_df = bq_df.drop_duplicates(subset=["reading_time", "region"], keep="last")
-
+        # In case new_df is empty initialise with a placeholder DataFrame
+        if new_df.empty:
+            # Create a placeholder Dataframe with just the current cutoff for all regions
+            new_df = pd.DataFrame({
+                'reading_time': [cutoff] * 4,
+                'region': ['Central', 'East', 'North', 'West']
+            })
         # Check if the BigQuery DataFrame is empty
         if bq_df.empty:
             logging.info("BigQuery DataFrame is empty. Using all new data with matching schema.")
@@ -129,6 +187,21 @@ def overwrite_recent_values_with_time_regressors(
 
             logging.info(f"Created new DataFrame from new data, shape: {result_df.shape}")
             return result_df
+        
+        # Replace pd.NA with np.nan in numeric columns to avoid NAType errors
+        for df in [bq_df, new_df]:
+            for col in df.select_dtypes(include=['number']).columns:
+                if pd.isna(df[col]).any():
+                    df[col] = df[col].fillna(np.nan)
+
+        # Check for duplicates in indices before any operations
+        if new_df.duplicated(subset=["reading_time", "region"]).any():
+            logging.warning("Duplicates found in new_df. Taking the last occurrence.")
+            new_df = new_df.drop_duplicates(subset=["reading_time", "region"], keep="last")
+            
+        if bq_df.duplicated(subset=["reading_time", "region"]).any():
+            logging.warning("Duplicates found in bq_df. Taking the last occurrence.")
+            bq_df = bq_df.drop_duplicates(subset=["reading_time", "region"], keep="last")
             
         # Continue with the regular processing if bq_df is not empty
         new_df = new_df.set_index(["reading_time", "region"])
@@ -177,6 +250,15 @@ def overwrite_recent_values_with_time_regressors(
         
         # Merge time dimensions to new rows
         if not new_rows.empty:
+            # Add in rows including the cutoff in case it is not present
+            if not (new_rows['reading_time'] == cutoff).any():
+                cutoff_row = pd.DataFrame({
+                    'reading_time': [cutoff] * 4,
+                    'region': ['Central', 'East', 'North', 'West']
+                })
+                new_rows = pd.concat([new_rows, cutoff_row], ignore_index=True)
+                logging.info(f"Added cutoff {cutoff} rows")
+            
             new_rows = new_rows.merge(time_dim, on=["reading_time", "region"], how="left")
             
             # Ensure column alignment before concatenation
@@ -236,79 +318,146 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
         logging.error(f"INCIDENT: Failed to fill missing values: {e}")
         raise
 
-def update_bq_data(bq_client: bigquery.Client, table_id: str, df: pd.DataFrame, cutoff: pd.Timestamp):
+def update_bq_data(cutoff: pd.Timestamp, bq_client: bigquery.Client, records_table_id: str, records_df: pd.DataFrame, forecast_table_id: str = None, forecasts: pd.DataFrame = None):
+    """
+    Update BigQuery tables with new data and forecasts.
+    
+    Args:
+        cutoff: Timestamp for the current execution, used to determine data to delete
+        bq_client: BigQuery client
+        records_table_id: Main table ID to update
+        records_df: DataFrame with updated records
+        forecast_table_id: Forecast table ID (optional)
+        forecasts: DataFrame with forecast records (optional)
+
+    """
     try:
-        # Make a copy to avoid modifying the original DataFrame
-        df = df.copy()
+        # Prepare main table data
+        records_df = _prepare_dataframe_for_bq(records_df, bq_client, records_table_id)
+        temp_table = records_table_id + "_staging"
+        _upload_dataframe_to_staging(bq_client, records_df, temp_table)
         
-        # Get the table schema
-        table = bq_client.get_table(table_id)
-        schema = table.schema
-        
-        # Create a mapping of column names to their BigQuery types
-        schema_dict = {field.name: field.field_type for field in schema}
-        
-        # Convert DataFrame types based on BigQuery schema
-        for col in df.columns:
-            if col in schema_dict:
-                # Convert based on BigQuery type
-                if schema_dict[col] in ('INTEGER', 'INT64'):
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
-                elif schema_dict[col] in ('FLOAT', 'FLOAT64'):
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype('float64')
-                elif schema_dict[col] in ('BOOLEAN', 'BOOL'):
-                    df[col] = df[col].fillna(False).astype('bool')
-                elif schema_dict[col] == 'TIMESTAMP':
-                    # Use utc=True for handling timezone-aware datetimes
-                    df[col] = pd.to_datetime(df[col], utc=True)
-                elif schema_dict[col] == 'STRING':
-                    df[col] = df[col].fillna('').astype(str)
-        
-        # bq_cutoff set to 20 minutes before current cutoff execution time
-        bq_cutoff = (cutoff - pd.Timedelta(minutes=20)).isoformat()
-        
-        # Set up staging table
-        temp_table = table_id + "_staging"
-        
-        # Use explicit schema in job config
-        job_config = bigquery.LoadJobConfig(
-            schema=schema,
-            write_disposition="WRITE_TRUNCATE"
-            # Removed the invalid property: use_pandas_gbq=True
-        )
-        
-        # Load DataFrame to staging table with explicit schema
-        load_job = bq_client.load_table_from_dataframe(df, temp_table, job_config=job_config)
-        load_job.result()  # Wait for the load job to complete
-        
-        logging.info(f"Loaded {len(df)} rows into staging table {temp_table}")
-        
-        # Use explicit column names in SQL
-        column_names = [field.name for field in schema]
-        columns_sql = ", ".join([f"`{col}`" for col in column_names])
-        
-        # Use query parameters for improved security and performance
+        # Calculate cutoff for data deletion (4 hours before execution time)
+        bq_cutoff = (cutoff - pd.Timedelta(hours=4)).isoformat()
+
+        # Prepare SQL transaction
+        sql_parts = []
         query_params = [
             bigquery.ScalarQueryParameter("cutoff", "TIMESTAMP", bq_cutoff)
         ]
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=query_params
-        )
+        
+        # Add main table update SQL
+        column_names = [col for col in records_df.columns]
+        columns_sql = ", ".join([f"`{col}`" for col in column_names])
+        
+        sql_parts.append(f"""
+            -- Update main table
+            DELETE FROM {records_table_id}
+            WHERE reading_time >= TIMESTAMP(@cutoff);
+            
+            INSERT INTO {records_table_id} ({columns_sql})
+            SELECT {columns_sql} FROM {temp_table};
+        """)
+        
+        # Handle forecasts if provided
+        if forecast_table_id is not None and forecasts is not None and not forecasts.empty:
+            # Prepare forecast data
+            forecasts = forecasts.copy()
+            if 'created_at' not in forecasts.columns:
+                forecasts['created_at'] = cutoff
+                
+            forecasts = _prepare_timestamp_columns(forecasts, ['timestamp', 'created_at'])
+            
+            # Upload to staging
+            forecast_temp_table = forecast_table_id + "_staging"
+            _upload_dataframe_to_staging(bq_client, forecasts, forecast_temp_table)
+            
+            # Add forecast table replacement SQL
+            forecast_columns = forecasts.columns.tolist()
+            forecast_columns_sql = ", ".join([f"`{col}`" for col in forecast_columns])
+            
+            sql_parts.append(f"""
+                -- Complete replacement of the forecast table
+                DELETE FROM {forecast_table_id} WHERE 1=1;
+                
+                INSERT INTO {forecast_table_id} ({forecast_columns_sql})
+                SELECT {forecast_columns_sql} FROM {forecast_temp_table};
+            """)
         
         # Execute transaction
-        sql = f"""
-        BEGIN TRANSACTION;
-          DELETE FROM `{table_id}`
-          WHERE reading_time >= TIMESTAMP(@cutoff);
-          INSERT INTO `{table_id}` ({columns_sql})
-          SELECT {columns_sql} FROM `{temp_table}`;
-        COMMIT TRANSACTION;
-        """
+        sql = "BEGIN TRANSACTION;\n" + "\n".join(sql_parts) + "\nCOMMIT TRANSACTION;"
+        
+        job_config = bigquery.QueryJobConfig(query_parameters=query_params)
         job = bq_client.query(sql, job_config=job_config)
         job.result()  # Wait for query job to complete
         
-        logging.info(f"Updated BigQuery table {table_id} with new data from cutoff {bq_cutoff}")
+        logging.info(f"Updated BigQuery table {records_table_id}" + 
+                    (f" and replaced all forecasts in {forecast_table_id}" if forecast_table_id else ""))
+            
     except Exception as e:
-        logging.error(f"INCIDENT: Failed to update BigQuery table {table_id}: {e}")
+        logging.error(f"INCIDENT: Failed to update BigQuery tables: {e}")
         logging.error(f"Error details: {str(e)}")
+        raise
+
+def _prepare_dataframe_for_bq(df: pd.DataFrame, bq_client: bigquery.Client, table_id: str) -> pd.DataFrame:
+    """Prepare DataFrame with correct types based on BigQuery table schema."""
+    df = df.copy()
+    
+    # Get the table schema
+    table = bq_client.get_table(table_id)
+    schema = table.schema
+    
+    # Create a mapping of column names to their BigQuery types
+    schema_dict = {field.name: field.field_type for field in schema}
+    
+    # Convert DataFrame types based on BigQuery schema
+    for col in df.columns:
+        if col in schema_dict:
+            # Convert based on BigQuery type
+            if schema_dict[col] in ('INTEGER', 'INT64'):
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64')
+            elif schema_dict[col] in ('FLOAT', 'FLOAT64'):
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).astype('float64')
+            elif schema_dict[col] in ('BOOLEAN', 'BOOL'):
+                df[col] = df[col].fillna(False).astype('bool')
+            elif schema_dict[col] == 'TIMESTAMP':
+                # Use utc=True for handling timezone-aware datetimes
+                df[col] = pd.to_datetime(df[col], utc=True)
+            elif schema_dict[col] == 'STRING':
+                df[col] = df[col].fillna('').astype(str)
+    
+    return df
+
+def _prepare_timestamp_columns(df: pd.DataFrame, timestamp_columns: list) -> pd.DataFrame:
+    """Prepare timestamp columns in a DataFrame."""
+    df = df.copy()
+    for col in timestamp_columns:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], utc=True)
+    return df
+
+def _upload_dataframe_to_staging(bq_client: bigquery.Client, df: pd.DataFrame, staging_table: str) -> None:
+    """Upload DataFrame to BigQuery staging table."""
+    try:
+        # Get schema if table exists, otherwise None (let BQ infer)
+        schema = None
+        try:
+            table = bq_client.get_table(staging_table)
+            schema = table.schema
+        except Exception:
+            pass
+        
+        # Create job config
+        job_config = bigquery.LoadJobConfig(
+            schema=schema,
+            write_disposition="WRITE_TRUNCATE"
+        )
+        
+        # Load DataFrame to staging table
+        load_job = bq_client.load_table_from_dataframe(df, staging_table, job_config=job_config)
+        load_job.result()  # Wait for the load job to complete
+        
+        logging.info(f"Loaded {len(df)} rows into staging table {staging_table}")
+    except Exception as e:
+        logging.error(f"Failed to upload DataFrame to staging table {staging_table}: {e}")
         raise
