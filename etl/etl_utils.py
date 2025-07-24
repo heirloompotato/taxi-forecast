@@ -51,6 +51,67 @@ def load_model_from_gcs(bucket_name, model_path="models/xgboost_model_2h.pkl"):
         logging.error(f"INCIDENT: Failed to load model from GCS: {str(e)}")
         raise
 
+def load_prophet_base_forecasts_from_gcs(bucket_name, folder_path):
+    """
+    Load prophet base forecasts from GCS bucket into a dictionary of pandas DataFrames.
+    
+    Args:
+        bucket_name (str): The name of the GCS bucket
+        folder_path (str): The folder path within the bucket where prophet forecast files are stored
+        
+    Returns:
+        dict: Dictionary with region names as keys and prophet forecasts as DataFrames
+    """
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        
+        # Initialize the dictionary to store the forecasts
+        prophet_base_forecasts = {}
+        
+        # The region names to look for
+        regions = ['Central', 'North', 'East', 'West']
+        
+        for region in regions:
+            # Construct the blob name for this region
+            blob_name = f"{folder_path}{region}.csv"
+            
+            # Get the blob
+            blob = bucket.blob(blob_name)
+            
+            # Check if the blob exists
+            if not blob.exists():
+                logging.warning(f"No prophet base forecast file found for region {region} at {blob_name}")
+                continue
+                
+            # Download the CSV data
+            data = blob.download_as_text()
+            logging.info(f"Loaded {blob_name} from bucket {bucket_name}")
+            
+            # Convert to DataFrame
+            df = pd.read_csv(StringIO(data))
+            
+            # Convert 'ds' column to datetime with UTC timezone
+            if 'ds' in df.columns:
+                df['ds'] = pd.to_datetime(df['ds'], utc=True)
+            else:
+                logging.warning(f"No 'ds' column found in prophet forecast for region {region}")
+                continue
+            
+            # Store in the dictionary
+            prophet_base_forecasts[region] = df
+        
+        if not prophet_base_forecasts:
+            logging.error("INCIDENT: No prophet base forecasts were loaded successfully")
+            raise ValueError("No prophet base forecasts could be loaded")
+            
+        logging.info(f"Successfully loaded prophet base forecasts for {list(prophet_base_forecasts.keys())}")
+        return prophet_base_forecasts
+        
+    except Exception as e:
+        logging.error(f"INCIDENT: Failed to load prophet base forecasts from {bucket_name}/{folder_path}: {e}")
+        raise
+
 def ceil_dt_to_5min(dt_series: pd.Series) -> pd.Series:
     """Round up pandas datetime series to the next 5-minute interval."""
     return (dt_series + pd.Timedelta(minutes=4)).dt.floor('5min')

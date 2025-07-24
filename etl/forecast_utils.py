@@ -36,178 +36,101 @@ def _prepare_xgboost_data(df):
     
     return xgb_df
 
-def _apply_smoothing(forecast_df):
-    """Apply exponential smoothing to predictions to reduce zigzags."""
-    for region in forecast_df['region_name'].unique():
-        region_mask = forecast_df['region_name'] == region
-        region_values = forecast_df.loc[region_mask, 'predicted_value'].values
-        
-        # Apply exponential smoothing
-        alpha = 0.7
-        smoothed = [region_values[0]]
-        for i in range(1, len(region_values)):
-            smoothed.append(alpha * region_values[i] + (1-alpha) * smoothed[i-1])
-            
-        forecast_df.loc[region_mask, 'predicted_value'] = smoothed
-    
-    return forecast_df
-
-def _add_dynamic_confidence_intervals(forecast_df):
-    """Add dynamic confidence intervals that widen over time."""
-    for region in forecast_df['region_name'].unique():
-        region_mask = forecast_df['region_name'] == region
-        forecast_region = forecast_df[region_mask].sort_values('timestamp')
-        
-        # Get number of timestamps for this region
-        n_timestamps = len(forecast_region)
-        
-        # Create increasing factors (1.0 to 2.0)
-        factors = np.linspace(1.0, 2.0, n_timestamps)
-        
-        # Calculate base width
-        base_std = forecast_region['predicted_value'].std() * 0.5 if len(forecast_region) > 1 else 10
-        center = forecast_region['predicted_value']
-        
-        # Recalculate bounds with widening factors
-        new_lower = center - 1.96 * base_std * factors
-        new_upper = center + 1.96 * base_std * factors
-        
-        # Update the DataFrame
-        forecast_df.loc[region_mask, 'lower_bound_95'] = new_lower.values
-        forecast_df.loc[region_mask, 'upper_bound_95'] = new_upper.values
-    
-    return forecast_df
-
-def _forecast_future_with_xgboost(model, xgb_df, features, time_dim, future_periods=24):
-    """Generate forecasts for future periods using XGBoost."""
+def _forecast_future_with_xgboost(model, xgb_df, features, prophet_base_forecasts, execution_ts):
+    """Generate forecasts for future periods by predicting residuals from Prophet with XGBoost."""
     all_forecasts = []
     
+    # Predict residuals for current timestamp using XGBoost
+    current_xgb_df = xgb_df[xgb_df['reading_time'] == execution_ts].copy()
+    current_xgb_df['resid_2h_pred'] = model.predict(current_xgb_df[features])
+
+    # Filter prophet_base_forecasts for values from current timestamp until 2h later
     for region in ['Central', 'North', 'East', 'West']:
-        # Only select data for this region and ensure unique index
-        region_df = xgb_df[xgb_df['region'] == region].copy()
-        region_df = region_df.reset_index(drop=True)
+
+        # Get the base prophet forecast for the region
+        if region not in prophet_base_forecasts:
+            logging.warning(f"No prophet base forecast available for region {region}, skipping")
+            continue
+        region_prophet_df = prophet_base_forecasts[region]
+        region_prophet_df = region_prophet_df[(region_prophet_df['ds'] > execution_ts) & (region_prophet_df['ds'] <= execution_ts + pd.Timedelta(hours=2))].copy()
+
+        # Get current region residual
+        if current_xgb_df.empty:
+            logging.warning(f"No current data available for region {region}, skipping forecast")
+            continue
+        region_xgb_df = current_xgb_df[current_xgb_df['region'] == region].copy()
+        # Should only be one row, take the value
+        region_xgb_residual = region_xgb_df['resid_2h_pred'].values[0]
+        region_xgb_current_taxis = region_xgb_df['num_taxis'].values[0]
         
-        if len(region_df) == 0:
-            logging.warning(f"No data available for region {region}, skipping forecast")
+        # Create a copy of the region forecasts to avoid modifying original data
+        region_forecast = region_prophet_df.copy()
+        
+        # Calculate number of timesteps (should be 24 for 5-minute intervals over 2 hours)
+        num_timesteps = len(region_forecast)
+        
+        # Create weights for smooth transition from current value to residual-adjusted forecast
+        # First value should be closest to current value, last value should be fully residual-adjusted
+        if num_timesteps > 0:
+            weights = np.linspace(0, 1, num_timesteps)
+        else:
+            # Handle empty dataframe case
+            logging.warning(f"No timesteps found for region {region}, skipping forecast")
             continue
         
-        # Start with the last known datapoints
-        future_rows = []
-        last_known = region_df.iloc[-future_periods:].copy() if len(region_df) >= future_periods else region_df.copy()
+        # Calculate the target value at 2 hours (last point)
+        target_value_at_2h = region_forecast.iloc[-1]['yhat'] + region_xgb_residual
         
-        # Create future timestamps
-        last_time = region_df['reading_time'].max()
-        future_times = pd.date_range(
-            start=last_time + pd.Timedelta(minutes=5), 
-            periods=future_periods, 
-            freq='5min',
-            tz='UTC'
-        )
-        
-        # Create a dataframe with future timestamps
-        for i, future_time in enumerate(future_times):
-            # Use the base row from last_known
-            new_row = last_known.iloc[i % len(last_known)].copy()
-            new_row['reading_time'] = future_time
+        # Apply smoothing from current value to residual-adjusted forecast
+        for i in range(len(region_forecast)):
+            # Weight determines how much of the residual to apply at each step
+            weight = weights[i]
             
-            # Get time regressors from time_dim
-            time_regressors = time_dim[time_dim['reading_time'] == future_time]
-            if len(time_regressors) > 0:
-                # Copy time regressors from time_dim
-                for col in ['minute', 'hour', 'hour_decimal', 'dayofweek', 'is_weekend', 
-                           'is_surcharge_hour', 'time_sin', 'time_cos']:
-                    if col in time_regressors.columns:
-                        new_row[col] = time_regressors.iloc[0][col]
+            # Calculate adjusted forecast (gradually applying more of the residual)
+            if i == len(region_forecast) - 1:
+                # For the last point (2h forecast), ensure it's exactly yhat + resid_2h_pred
+                region_forecast.loc[region_forecast.index[i], 'predicted_value'] = target_value_at_2h
             else:
-                # If not found in time_dim, calculate them
-                new_row['minute'] = future_time.minute
-                new_row['hour'] = future_time.hour
-                new_row['hour_decimal'] = future_time.hour + future_time.minute / 60
-                new_row['dayofweek'] = future_time.dayofweek
-                new_row['is_weekend'] = 1 if future_time.dayofweek >= 5 else 0
-                
-                # Time cyclical features
-                minutes_in_day = future_time.hour * 60 + future_time.minute
-                new_row['time_sin'] = np.sin(2 * np.pi * minutes_in_day / (24 * 60))
-                new_row['time_cos'] = np.cos(2 * np.pi * minutes_in_day / (24 * 60))
-                
-                # Surcharge hours
-                is_surcharge = (future_time.hour >= 0 and future_time.hour < 6) or \
-                               (future_time.hour >= 18 and future_time.hour < 24)
-                new_row['is_surcharge_hour'] = 1 if is_surcharge else 0
-
-            future_rows.append(new_row)
-        
-        # Create future dataframe
-        future_df = pd.DataFrame(future_rows).reset_index(drop=True)
-        
-        # Make forecasts iteratively
-        for i in range(future_periods):
-            if i > 0:
-                # Update lag features based on previous predictions
-                for lag in [1, 2, 3, 6, 12]:
-                    lag_idx = i - lag
-                    if lag_idx >= 0:
-                        future_df.loc[i, f'taxi_lag_{lag}'] = future_df.loc[lag_idx, 'num_taxis']
-                    else:
-                        if abs(lag_idx) < len(region_df):
-                            future_df.loc[i, f'taxi_lag_{lag}'] = region_df.iloc[lag_idx]['num_taxis']
+                # For intermediate points, smoothly transition
+                # Start close to current value and gradually approach the residual-adjusted forecast
+                current_to_forecast_blend = region_xgb_current_taxis * (1 - weight) + region_forecast.iloc[i]['yhat'] * weight
+                residual_effect = region_xgb_residual * weight
+                region_forecast.loc[region_forecast.index[i], 'predicted_value'] = current_to_forecast_blend + residual_effect
             
-            # Update rolling mean features
-            for window in [4, 12, 24, 48]:
-                values_to_consider = []
-                for w in range(window):
-                    w_idx = i - w
-                    if w_idx >= 0:
-                        values_to_consider.append(future_df.iloc[w_idx]['num_taxis'])
-                    else:
-                        if abs(w_idx) < len(region_df):
-                            values_to_consider.append(region_df.iloc[w_idx]['num_taxis'])
-                future_df.loc[i, f'taxi_rolling_{window}'] = np.mean(values_to_consider) if values_to_consider else np.nan
-            
-            # Make prediction
-            X_future = future_df.iloc[i:i+1][features].copy()
-            if X_future.isna().any().any():
-                X_future = X_future.fillna(0)
-                
-            y_pred = model.predict(X_future)[0]
-            future_df.loc[i, 'num_taxis'] = y_pred
-            
-        # Prepare forecast dataframe
-        forecast_df = pd.DataFrame({
-            'timestamp': future_df['reading_time'],
-            'region_name': region,
-            'predicted_value': future_df['num_taxis'],
-            'model_version': 'xgboost_v1'
-        })
+            # Adjust upper and lower bounds by the same residual proportion
+            region_forecast.loc[region_forecast.index[i], 'lower_bound_95'] = region_forecast.iloc[i]['yhat_lower'] + (region_xgb_residual * weight)
+            region_forecast.loc[region_forecast.index[i], 'upper_bound_95'] = region_forecast.iloc[i]['yhat_upper'] + (region_xgb_residual * weight)
         
-        all_forecasts.append(forecast_df)
+        # Add region name and model version
+        region_forecast['region_name'] = region
+        region_forecast['model_version'] = 'prophet_xgb_hybrid_v3'
+        
+        # Rename 'ds' to 'timestamp'
+        region_forecast = region_forecast.rename(columns={'ds': 'timestamp'})
+        
+        # Select only the required columns
+        region_forecast = region_forecast[['timestamp', 'region_name', 'predicted_value', 'lower_bound_95', 'upper_bound_95', 'model_version']]
+        
+        # Add to the list of all forecasts
+        all_forecasts.append(region_forecast)
     
-    # Combine all forecasts
+    # Combine all regional forecasts
     if all_forecasts:
-        combined_forecasts = pd.concat(all_forecasts, ignore_index=True)
-        
-        # Add confidence intervals
-        combined_forecasts = _add_dynamic_confidence_intervals(combined_forecasts)
-        
-        # Apply smoothing
-        combined_forecasts = _apply_smoothing(combined_forecasts)
-        
-        return combined_forecasts
+        final_forecast_df = pd.concat(all_forecasts, ignore_index=True)
+        return final_forecast_df
     else:
-        # Return empty DataFrame with correct structure
-        return pd.DataFrame(columns=['timestamp', 'region_name', 'predicted_value', 
-                                    'lower_bound_95', 'upper_bound_95', 'model_version'])
+        logging.warning("No forecasts were generated")
+        return pd.DataFrame(columns=['timestamp', 'region_name', 'predicted_value', 'lower_bound_95', 'upper_bound_95', 'model_version'])
 
-def forecast_num_taxis(df, time_dim, model, execution_ts=None, horizon=24):
+
+def forecast_num_taxis(df, prophet_base_forecasts, model, execution_ts=None):
     """
     Generate forecasts for the next 2 hours (24 5-minute periods).
     
     Args:
         df: DataFrame with current data
-        time_dim: DataFrame with time dimension data
+        prophet_base_forecasts: DataFrame with Prophet base forecasts
         execution_ts: The execution timestamp (if None, will use the max reading_time)
-        horizon: Number of periods to forecast
         model: The trained model to use for forecasting
     """
     try:        
@@ -228,7 +151,7 @@ def forecast_num_taxis(df, time_dim, model, execution_ts=None, horizon=24):
         xgb_df = _prepare_xgboost_data(df)
         
         # Generate forecasts
-        forecasts = _forecast_future_with_xgboost(model, xgb_df, features, time_dim, future_periods=horizon)
+        forecasts = _forecast_future_with_xgboost(model, xgb_df, features, prophet_base_forecasts, execution_ts)
         
         if forecasts.empty:
             logging.warning("No forecasts were generated, returning original dataframe")
@@ -289,10 +212,10 @@ def forecast_num_taxis(df, time_dim, model, execution_ts=None, horizon=24):
                             for idx in exec_region_rows.index:
                                 records_df.loc[idx, col_name] = forecast_value
         
-        # Fill any missing forecast values with zeros
+        # Fill any missing forecast values with ffill if not zeros
         for col_name in horizon_mapping.values():
             if col_name in records_df.columns:
-                records_df[col_name] = records_df[col_name].fillna(0)
+                records_df[col_name] = records_df[col_name].ffill().fillna(0)
             else:
                 records_df[col_name] = 0
         
@@ -301,7 +224,9 @@ def forecast_num_taxis(df, time_dim, model, execution_ts=None, horizon=24):
     
     except Exception as e:
         logging.error(f"Error during forecast generation: {str(e)}")
-        # If forecasting fails, fill forecast columns with zeros
+        # If forecasting fails, ffill forecasts, if it fails fill with zeros
         for col_name in ['forecast_halfh', 'forecast_1h', 'forecast_1halfh', 'forecast_2h']:
-            df[col_name] = df[col_name].fillna(0)
-        return df, None
+            if col_name in df.columns:
+                df[col_name] = df[col_name].ffill().fillna(0)
+            else:
+                df[col_name] = 0

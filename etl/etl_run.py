@@ -37,7 +37,8 @@ def run_etl():
         area_to_region_df = etl_utils.load_csv_from_gcs(config_bucket, "area_dim.csv")
         time_dim = etl_utils.load_csv_from_gcs(config_bucket, "time_grid.csv")
         time_dim['reading_time'] = pd.to_datetime(time_dim['reading_time'])
-        model = etl_utils.load_model_from_gcs(config_bucket, "model/xgboost_model_2h.pkl")
+        model = etl_utils.load_model_from_gcs(config_bucket, "model/xgboost_model_v3.pkl")
+        prophet_base_forecasts = etl_utils.load_prophet_base_forecasts_from_gcs(config_bucket, "prophet_base_forecasts/")
         logging.info("Config tables and model loaded successfully")
 
         # Parse data from GCS bucket
@@ -74,7 +75,7 @@ def run_etl():
         # Forecast num taxis
         forecasted_records, forecasts = forecast_utils.forecast_num_taxis(
             ffilled_records, 
-            time_dim=time_dim,
+            prophet_base_forecasts=prophet_base_forecasts,
             model=model,
             execution_ts=cutoff
         )

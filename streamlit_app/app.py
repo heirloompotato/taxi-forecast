@@ -28,7 +28,7 @@ st.markdown("""
 
 # Title and description
 st.title("🚕 Singapore Taxi Availability Forecast [BETA]")
-st.markdown("Real-time taxi availability with 2-hour forecasts by region. Note that this app is in beta and may have inaccurate forecasts due to limited training data. View project documentation and source code on [GitHub](https://github.com/heirloompotato/taxi-forecast).")
+st.markdown("Real-time taxi availability with 2-hour forecasts by region. Note that this app is in beta and may have inaccurate forecasts due to limited training data (last forecast update 24 Jul 11:30 pm). View project documentation and source code on [GitHub](https://github.com/heirloompotato/taxi-forecast).")
 
 # Sidebar
 st.sidebar.header("Controls")
@@ -361,4 +361,4 @@ st.caption("Data updates every 5 minutes | Last updated: " +
         st.session_state.cutoff.tz_convert('Asia/Singapore').strftime("%Y-%m-%d %H:%M:%S"))
 
 with st.expander("ℹ️ About this App"):
-    st.write("""This app provides accurate real-time taxi availability data for Singapore using open source LTA APIs and forecasts with data from open source NEA weather APIs. Forecasts are generated using XGBoost trained on historical taxi data, weather patterns, and time-based features.""")
+    st.write("""This app provides accurate real-time taxi availability data for Singapore using open source LTA APIs and forecasts with data from open source NEA weather APIs. The forecasting employs a two-stage hybrid approach: First, Prophet generates baseline forecasts using historical taxi demand patterns. Then, XGBoost refines these forecasts by predicting the residuals 2 hours ahead using additional features including rolling averages, lagged values, weather conditions, and temporal indicators. This hybrid model captures both the long-term seasonality through Prophet and short-term fluctuations through XGBoost, delivering more accurate taxi demand predictions.""")
