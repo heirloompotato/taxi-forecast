@@ -27,28 +27,49 @@ def load_csv_from_gcs(bucket_name, blob_name):
         logging.error(f"INCIDENT: Failed to load {blob_name} from {bucket_name}: {e}")
         raise
 
-def load_model_from_gcs(bucket_name, model_path="models/xgboost_model_2h.pkl"):
-    """Load the XGBoost model from Google Cloud Storage."""
+from google.cloud import storage
+import pickle
+import os
+import logging
+import re
+
+def load_models_from_gcs(bucket_name: str, model_dir: str = "models/") -> dict:
+    """
+    Load all XGBoost models from a GCS directory and return a dictionary of models 
+    with horizon keys like '0.5h', '1h', etc.
+
+    Assumes model filenames are in the format: xgboost_model_<horizon>.pkl
+    Example: xgboost_model_0.5h.pkl, xgboost_model_1h.pkl
+    """
     try:
         client = storage.Client()
         bucket = client.bucket(bucket_name)
-        blob = bucket.blob(model_path)
-        
-        # Download to a temporary file
-        temp_file = "/tmp/temp_model.pkl"
-        blob.download_to_filename(temp_file)
-        
-        # Load the model
-        with open(temp_file, "rb") as f:
-            model = pickle.load(f)
-        
-        # Clean up
-        os.remove(temp_file)
-        
-        logging.info(f"Successfully loaded model from gs://{bucket_name}/{model_path}")
-        return model
+        blobs = bucket.list_blobs(prefix=model_dir)
+
+        models = {}
+        for blob in blobs:
+            if blob.name.endswith(".pkl"):
+                # Extract horizon from filename, e.g., 'xgboost_model_1.5h.pkl'
+                match = re.search(r"xgboost_model_([\d\.]+h)\.pkl", blob.name)
+                if match:
+                    horizon = match.group(1)
+                    temp_file = "/tmp/temp_model.pkl"
+                    blob.download_to_filename(temp_file)
+                    
+                    with open(temp_file, "rb") as f:
+                        models[horizon] = pickle.load(f)
+
+                    os.remove(temp_file)
+                    logging.info(f"Loaded model for {horizon} from gs://{bucket_name}/{blob.name}")
+                else:
+                    logging.warning(f"Skipped file without valid horizon format: {blob.name}")
+
+        if not models:
+            logging.warning(f"No valid models found in gs://{bucket_name}/{model_dir}")
+        return models
+
     except Exception as e:
-        logging.error(f"INCIDENT: Failed to load model from GCS: {str(e)}")
+        logging.error(f"INCIDENT: Failed to load models from GCS: {str(e)}")
         raise
 
 def load_prophet_base_forecasts_from_gcs(bucket_name, folder_path):

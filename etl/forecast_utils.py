@@ -36,13 +36,14 @@ def _prepare_xgboost_data(df):
     
     return xgb_df
 
-def _forecast_future_with_xgboost(model, xgb_df, features, prophet_base_forecasts, execution_ts):
+def _forecast_future_with_xgboost(models, xgb_df, features, prophet_base_forecasts, execution_ts):
     """Generate forecasts for future periods by predicting residuals from Prophet with XGBoost."""
     all_forecasts = []
     
     # Predict residuals for current timestamp using XGBoost
     current_xgb_df = xgb_df[xgb_df['reading_time'] == execution_ts].copy()
-    current_xgb_df['resid_2h_pred'] = model.predict(current_xgb_df[features])
+    for horizon, model in models.items():
+        current_xgb_df[f'resid_{horizon}_pred'] = model.predict(current_xgb_df[features])
 
     # Filter prophet_base_forecasts for values from current timestamp until 2h later
     for region in ['Central', 'North', 'East', 'West']:
@@ -59,61 +60,51 @@ def _forecast_future_with_xgboost(model, xgb_df, features, prophet_base_forecast
             logging.warning(f"No current data available for region {region}, skipping forecast")
             continue
         region_xgb_df = current_xgb_df[current_xgb_df['region'] == region].copy()
-        # Should only be one row, take the value
-        region_xgb_residual = region_xgb_df['resid_2h_pred'].values[0]
+        # Extract residuals for each forecast horizon
+        resid_0_5h = region_xgb_df['resid_0.5h_pred'].values[0]
+        resid_1h = region_xgb_df['resid_1h_pred'].values[0]
+        resid_1_5h = region_xgb_df['resid_1.5h_pred'].values[0]
+        resid_2h = region_xgb_df['resid_2h_pred'].values[0]
         region_xgb_current_taxis = region_xgb_df['num_taxis'].values[0]
-        
-        # Create a copy of the region forecasts to avoid modifying original data
+
         region_forecast = region_prophet_df.copy()
-        
-        # Calculate number of timesteps (should be 24 for 5-minute intervals over 2 hours)
         num_timesteps = len(region_forecast)
-        
-        # Create weights for smooth transition from current value to residual-adjusted forecast
-        # First value should be closest to current value, last value should be fully residual-adjusted
-        if num_timesteps > 0:
-            weights = np.linspace(0, 1, num_timesteps)
-        else:
-            # Handle empty dataframe case
-            logging.warning(f"No timesteps found for region {region}, skipping forecast")
+
+        if num_timesteps != 24:
+            logging.warning(f"Expected 24 time steps but got {num_timesteps} for region {region}")
             continue
-        
-        # Calculate the target value at 2 hours (last point)
-        target_value_at_2h = region_forecast.iloc[-1]['yhat'] + region_xgb_residual
-        
-        # Apply smoothing from current value to residual-adjusted forecast
-        for i in range(len(region_forecast)):
-            # Weight determines how much of the residual to apply at each step
-            weight = weights[i]
+
+        # Define segments per horizon (5-min intervals → 6 timesteps per 30 min)
+        segments = [
+            (0, 5, resid_0_5h),
+            (6, 11, resid_1h),
+            (12, 17, resid_1_5h),
+            (18, 23, resid_2h),
+        ]
+
+        # Apply residual blending per segment
+        for start, end, resid in segments:
+            seg_len = end - start + 1
+            weights = np.linspace(0, 1, seg_len)
             
-            # Calculate adjusted forecast (gradually applying more of the residual)
-            if i == len(region_forecast) - 1:
-                # For the last point (2h forecast), ensure it's exactly yhat + resid_2h_pred
-                region_forecast.loc[region_forecast.index[i], 'predicted_value'] = target_value_at_2h
-            else:
-                # For intermediate points, smoothly transition
-                # Start close to current value and gradually approach the residual-adjusted forecast
-                current_to_forecast_blend = region_xgb_current_taxis * (1 - weight) + region_forecast.iloc[i]['yhat'] * weight
-                residual_effect = region_xgb_residual * weight
+            for i, w in zip(range(start, end + 1), weights):
+                current_to_forecast_blend = region_xgb_current_taxis * (1 - w) + region_forecast.iloc[i]['yhat'] * w
+                residual_effect = resid * w
                 region_forecast.loc[region_forecast.index[i], 'predicted_value'] = current_to_forecast_blend + residual_effect
-            
-            # Adjust upper and lower bounds by the same residual proportion
-            region_forecast.loc[region_forecast.index[i], 'lower_bound_95'] = region_forecast.iloc[i]['yhat_lower'] + (region_xgb_residual * weight)
-            region_forecast.loc[region_forecast.index[i], 'upper_bound_95'] = region_forecast.iloc[i]['yhat_upper'] + (region_xgb_residual * weight)
-        
+                region_forecast.loc[region_forecast.index[i], 'lower_bound_95'] = region_forecast.iloc[i]['yhat_lower'] + resid * w
+                region_forecast.loc[region_forecast.index[i], 'upper_bound_95'] = region_forecast.iloc[i]['yhat_upper'] + resid * w
+
         # Add region name and model version
         region_forecast['region_name'] = region
-        region_forecast['model_version'] = 'prophet_xgb_hybrid_v3'
-        
+        region_forecast['model_version'] = 'prophet_xgb_hybrid_v4'
+
         # Rename 'ds' to 'timestamp'
         region_forecast = region_forecast.rename(columns={'ds': 'timestamp'})
-        
-        # Select only the required columns
+
+        # Keep only required columns
         region_forecast = region_forecast[['timestamp', 'region_name', 'predicted_value', 'lower_bound_95', 'upper_bound_95', 'model_version']]
-        
-        # Add to the list of all forecasts
         all_forecasts.append(region_forecast)
-    
+
     # Combine all regional forecasts
     if all_forecasts:
         final_forecast_df = pd.concat(all_forecasts, ignore_index=True)
@@ -123,7 +114,7 @@ def _forecast_future_with_xgboost(model, xgb_df, features, prophet_base_forecast
         return pd.DataFrame(columns=['timestamp', 'region_name', 'predicted_value', 'lower_bound_95', 'upper_bound_95', 'model_version'])
 
 
-def forecast_num_taxis(df, prophet_base_forecasts, model, execution_ts=None):
+def forecast_num_taxis(df, prophet_base_forecasts, models, execution_ts=None):
     """
     Generate forecasts for the next 2 hours (24 5-minute periods).
     
@@ -131,12 +122,13 @@ def forecast_num_taxis(df, prophet_base_forecasts, model, execution_ts=None):
         df: DataFrame with current data
         prophet_base_forecasts: DataFrame with Prophet base forecasts
         execution_ts: The execution timestamp (if None, will use the max reading_time)
-        model: The trained model to use for forecasting
+        models: Dictionary of trained residual models, at each horizon
+                 e.g. {0.5h: model_0_5h, 1h: model_1h, 1.5h: model_1_5h, 2h: model_2h}
     """
     try:        
         # Define features for the model
         features = [
-            'minute', 'hour', 'dayofweek', 'is_weekend', 'is_surcharge_hour', 
+            'num_taxis', 'minute', 'hour', 'dayofweek', 'is_weekend', 'is_surcharge_hour', 
             'time_sin', 'time_cos', 'humid', 'rain', 'temp',
             'region_Central', 'region_East', 'region_North', 'region_West',  # Note the correct order
             'taxi_lag_1', 'taxi_lag_2', 'taxi_lag_3', 'taxi_lag_6', 'taxi_lag_12',
@@ -151,7 +143,7 @@ def forecast_num_taxis(df, prophet_base_forecasts, model, execution_ts=None):
         xgb_df = _prepare_xgboost_data(df)
         
         # Generate forecasts
-        forecasts = _forecast_future_with_xgboost(model, xgb_df, features, prophet_base_forecasts, execution_ts)
+        forecasts = _forecast_future_with_xgboost(models, xgb_df, features, prophet_base_forecasts, execution_ts)
         
         if forecasts.empty:
             logging.warning("No forecasts were generated, returning original dataframe")
