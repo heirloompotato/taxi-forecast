@@ -74,25 +74,39 @@ def _forecast_future_with_xgboost(models, xgb_df, features, prophet_base_forecas
             logging.warning(f"Expected 24 time steps but got {num_timesteps} for region {region}")
             continue
 
-        # Define segments per horizon (5-min intervals → 6 timesteps per 30 min)
-        segments = [
-            (0, 5, resid_0_5h),
-            (6, 11, resid_1h),
-            (12, 17, resid_1_5h),
-            (18, 23, resid_2h),
-        ]
-
-        # Apply residual blending per segment
-        for start, end, resid in segments:
-            seg_len = end - start + 1
-            weights = np.linspace(0, 1, seg_len)
+        # Define target residuals at horizon points (5-min intervals → 6 timesteps per 30 min)
+        target_residuals = {
+            0: 0,               # Starting point (current time)
+            5: resid_0_5h,      # 0.5h 
+            11: resid_1h,       # 1h
+            17: resid_1_5h,     # 1.5h
+            23: resid_2h        # 2h
+        }
+        
+        # Create a smooth residual curve across all timesteps
+        residual_curve = np.zeros(num_timesteps)
+        indices = sorted(target_residuals.keys())
+        
+        # Fill in residual values using linear interpolation between target points
+        for i in range(len(indices)-1):
+            start_idx, end_idx = indices[i], indices[i+1]
+            start_val, end_val = target_residuals[start_idx], target_residuals[end_idx]
             
-            for i, w in zip(range(start, end + 1), weights):
-                current_to_forecast_blend = region_xgb_current_taxis * (1 - w) + region_forecast.iloc[i]['yhat'] * w
-                residual_effect = resid * w
-                region_forecast.loc[region_forecast.index[i], 'predicted_value'] = current_to_forecast_blend + residual_effect
-                region_forecast.loc[region_forecast.index[i], 'lower_bound_95'] = region_forecast.iloc[i]['yhat_lower'] + resid * w
-                region_forecast.loc[region_forecast.index[i], 'upper_bound_95'] = region_forecast.iloc[i]['yhat_upper'] + resid * w
+            # Linear interpolation between points
+            for j in range(start_idx, end_idx + 1):
+                if j == start_idx:
+                    residual_curve[j] = start_val
+                else:
+                    # Calculate position between start and end (0.0 to 1.0)
+                    pos = (j - start_idx) / (end_idx - start_idx)
+                    residual_curve[j] = start_val + pos * (end_val - start_val)
+        
+        # Apply the residuals to the forecasted values and confidence intervals
+        for i in range(num_timesteps):
+            # Update forecast and confidence intervals with residual effect
+            region_forecast.loc[region_forecast.index[i], 'predicted_value'] = region_forecast.iloc[i]['yhat'] + residual_curve[i]
+            region_forecast.loc[region_forecast.index[i], 'lower_bound_95'] = region_forecast.iloc[i]['yhat_lower'] + residual_curve[i]
+            region_forecast.loc[region_forecast.index[i], 'upper_bound_95'] = region_forecast.iloc[i]['yhat_upper'] + residual_curve[i]
 
         # Add region name and model version
         region_forecast['region_name'] = region
@@ -112,7 +126,6 @@ def _forecast_future_with_xgboost(models, xgb_df, features, prophet_base_forecas
     else:
         logging.warning("No forecasts were generated")
         return pd.DataFrame(columns=['timestamp', 'region_name', 'predicted_value', 'lower_bound_95', 'upper_bound_95', 'model_version'])
-
 
 def forecast_num_taxis(df, prophet_base_forecasts, models, execution_ts=None):
     """

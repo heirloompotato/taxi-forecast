@@ -1,10 +1,14 @@
 streamlit==1.47.0
-pandas
 plotly==6.2.0
+pandas
+numpy
 google-cloud-bigquery
 google-cloud-bigquery-storage
+google-cloud-storage
 google-auth
+google-auth-oauthlib
 db-dtypes
 folium
-streamlit-folium
+streamlit-folium==0.25.0
 h3
+Pillow

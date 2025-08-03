@@ -18,4 +18,4 @@ This tool showcases how **open transport data** can be combined with **cloud inf
 ├── collector/ # Cloud Run job that pulls live taxi & weather data every 5 mins <br>
 ├── config/ # Configuration for regional/area mappings, time regressors and ML model <br>
 ├── etl/ # Flask-based ETL API for transforming and loading into BigQuery <br>
-├── streamlit/ # Frontend dashboard visualizing trends and forecast
+├── streamlit_app/ # Frontend dashboard visualizing trends and forecast
