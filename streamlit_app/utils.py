@@ -19,13 +19,13 @@ BASE_FORECASTS_TABLE = os.getenv("BQ_BASE_FORECASTS_TABLE")
 MODEL_MAPE_TABLE = os.getenv("BQ_MODEL_MAPE_TABLE")
 BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_current_execution_ts() -> pd.Timestamp:
     """Rounds current UTC time to the next 5-minute interval."""
     now = pd.Timestamp.utcnow()
     return now.floor('5min')
 
-@st.cache_data()
+@st.cache_data(show_spinner=False)
 def get_max_capacity():
     """
     Get the maximum capacity for each region, from environment variables.
@@ -37,19 +37,35 @@ def get_max_capacity():
         'North': int(os.getenv("MAX_CAPACITY_NORTH", 477))
     }
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_bigquery_client(use_storage_api=True):
     """
     Get a configured BigQuery client with appropriate credentials.
-    Handles both local development and cloud deployment scenarios.
+    Optionally returns a BigQuery Storage client for faster data transfers.
+    
+    Args:
+        use_storage_api (bool): Whether to return a storage API client as well
+        
+    Returns:
+        tuple: (bigquery.Client, bigquery_storage.BigQueryReadClient) if use_storage_api=True
+               bigquery.Client otherwise
     """
-    # For GCP Cloud Run, use the default service account credentials
-    client = bigquery.Client()
-    print(f"Using GCP default credentials")
+    # Use service account key file or application default credentials
+    if os.path.exists('credentials.json'):
+        credentials = service_account.Credentials.from_service_account_file(
+            'credentials.json', 
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        client = bigquery.Client(credentials=credentials, project=credentials.project_id)
+        print(f"Using service account credentials for project: {credentials.project_id}")
+    else:
+        # Fall back to application default credentials
+        client = bigquery.Client()
+        print("Using application default credentials for BigQuery.")
     
     if use_storage_api:
         try:
-            storage_client = bigquery_storage.BigQueryReadClient()
+            storage_client = bigquery_storage.BigQueryReadClient(credentials=credentials if 'credentials' in locals() else None)
             print("Using BigQuery Storage API for faster data transfers.")
             return client, storage_client
         except ImportError:
@@ -58,20 +74,36 @@ def get_bigquery_client(use_storage_api=True):
     
     return client
 
-@st.cache_resource()
 def get_storage_client():
     """
-    Get a configured GCS Storage client.
-    """
-    try:
-        client = storage.Client()
-        print("Using Google Cloud Storage client.")
-        return client
-    except ImportError:
-        print("Google Cloud Storage client not installed. Install with: pip install google-cloud-storage")
-        return None
+    Returns a configured Google Cloud Storage (GCS) client.
 
-@st.cache_data(ttl=600)
+    Uses service account credentials if 'credentials.json' is found,
+    otherwise falls back to application default credentials.
+    
+    Returns:
+        storage.Client: Authenticated GCS client instance.
+    """
+    # Load service account credentials if available
+    if os.path.exists("credentials.json"):
+        credentials = service_account.Credentials.from_service_account_file(
+            "credentials.json",
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        print(f"Using service account credentials for GCS: {credentials.project_id}")
+    else:
+        print("Using application default credentials for GCS.")
+
+    try:
+        client = storage.Client(credentials=credentials if 'credentials' in locals() else None, 
+                                project=credentials.project_id if 'credentials' in locals() else None)
+        return client
+    except Exception as e:
+        print(f"Failed to initialize GCS client: {e}")
+        return None
+    
+
+@st.cache_data(ttl=900, show_spinner=False)
 def get_recent_records_data(cutoff, hours=6):  # Changed to 6 hours for forecast alignment
     """
     Get taxi data from BigQuery within a specific time window before the cutoff
@@ -131,7 +163,7 @@ def get_recent_records_data(cutoff, hours=6):  # Changed to 6 hours for forecast
 
     return df 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_forecast_data():
     """Get detailed forecast data from BigQuery"""
     bq_client, bq_storage_client = get_bigquery_client(use_storage_api=True)
@@ -150,7 +182,7 @@ def get_forecast_data():
 
     return df
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_base_forecast_data(cutoff, hours=2):
     """Get detailed forecast data from BigQuery"""
     bq_client, bq_storage_client = get_bigquery_client(use_storage_api=True)
@@ -177,7 +209,7 @@ def get_base_forecast_data(cutoff, hours=2):
 
     return df
 
-@st.cache_data()
+@st.cache_data(show_spinner=False)
 def get_model_mape_data():
     """Get detailed model mape data from BigQuery"""
     bq_client, bq_storage_client = get_bigquery_client(use_storage_api=True)
@@ -201,7 +233,7 @@ def get_model_mape_data():
     ).reset_index()
     return df
 
-@st.cache_resource()
+@st.cache_resource(show_spinner=False)
 def load_image_from_gcs(blob_path: str) -> Image.Image:
     # Initialize GCS client
     client = get_storage_client()
@@ -217,7 +249,7 @@ def load_image_from_gcs(blob_path: str) -> Image.Image:
     # Load into PIL
     return Image.open(BytesIO(image_bytes))
 
-@st.cache_resource()
+@st.cache_resource(show_spinner=False)
 def load_shap_beeswarm_from_gcs() -> dict:
     """Load SHAP beeswarm plot data from GCS"""
     # Load one shap beeswarm image for each horizon
@@ -290,7 +322,7 @@ def create_availability_forecast(selected_timeframe=0.5):
     all_regions_ras = 1 / (1 + np.exp(-all_regions_rel_dev * 5))  # sigmoid transformation
 
     # Calculate composite score for all regions
-    alpha = 0.5  # weight on absolute vs relative availability
+    alpha = 0.75  # weight on absolute vs relative availability
     all_regions_ctas = alpha * all_regions_aas + (1 - alpha) * all_regions_ras
 
     # Determine recommendation and explanation for all regions
@@ -331,7 +363,7 @@ def create_availability_forecast(selected_timeframe=0.5):
         ras = 1 / (1 + np.exp(-rel_dev * 5))  # sigmoid transformation
         
         # Calculate composite score (CTAS)
-        alpha = 0.5  # weight on absolute vs relative availability
+        alpha = 0.75  # weight on absolute vs relative availability
         ctas = alpha * aas + (1 - alpha) * ras
         
         # Determine recommendation and explanation
@@ -363,7 +395,7 @@ def _get_recommendation_and_explanation(ctas, f_taxi, rel_dev):
     Returns:
         tuple: (recommendation, explanation) strings
     """
-    if ctas > 0.75:
+    if ctas > 0.70:
         recommendation = "🟢 High availability"
         explanation = f"{f_taxi:,.0f} taxis available"
         if rel_dev > 0.1:
@@ -660,7 +692,7 @@ def create_singapore_availability_map(availability_data):
             ),
             popup=folium.Popup(popup_text, max_width=250)
         ).add_to(m)
-    
+
     # Add a horizontal legend at the bottom
     legend_html = """
     <div style="

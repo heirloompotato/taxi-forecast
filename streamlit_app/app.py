@@ -5,30 +5,48 @@ import plotly.graph_objects as go
 from utils import get_max_capacity,get_recent_records_data, get_forecast_data, get_base_forecast_data, get_model_mape_data, create_singapore_availability_map, get_current_execution_ts, create_availability_forecast, load_image_from_gcs, load_shap_beeswarm_from_gcs, format_sg_time, format_sg_datetime
 from streamlit_folium import st_folium
 
-def initialize_data_if_needed():
-    """Initialize all data exactly once per session"""
-    if "data_initialized" not in st.session_state:
-        with st.spinner("Loading data..."):
-            # Initialize all data in a single block to prevent partial state
+def refresh_data():
+    # Update last refresh time
+    st.session_state.last_refresh_time = pd.Timestamp.utcnow().tz_convert('Asia/Singapore')
+    # Clear initialized flag to force reload
+    st.session_state.data_initialized = False
+    st.session_state.refresh_requested = True
+
+# Function to initialize or refresh data
+def initialize_or_refresh_data():
+    """Initialize all data on first load or selectively refresh data when requested"""
+    # Determine if this is initial load or a refresh
+    is_initial_load = "data_initialized" not in st.session_state
+    is_refresh = not is_initial_load and st.session_state.data_initialized == False
+
+    if is_initial_load or is_refresh:
+        print("Refreshing or initializing data")
+        with st.spinner("Loading data..." if is_initial_load else "Refreshing data..."):
             data = {}
             
-            # Get all required data
-            data["max_cap"] = get_max_capacity()
+            # Always refresh these items
             data["cutoff"] = get_current_execution_ts()
-            data["last_refresh_time"] = pd.Timestamp.utcnow().tz_convert('Asia/Singapore')
+            print(f"Cutoff time: {data['cutoff']}")
+            data["last_refresh_time"] = st.session_state.get("last_refresh_time", pd.Timestamp.utcnow().tz_convert('Asia/Singapore'))
             data["records_data"] = get_recent_records_data(data["cutoff"], hours=6)
             data["forecast_data"] = get_forecast_data()
             data["base_forecast_data"] = get_base_forecast_data(data["cutoff"])
-            data["model_mape_data"] = get_model_mape_data()
-            data["shap_beeswarm_dict"] = load_shap_beeswarm_from_gcs()
-            data["arc_diagram"] = load_image_from_gcs("arc_diagram.jpg")
             
-            # Update session state all at once to avoid cascading updates
+            # Only load static data during initial load
+            if is_initial_load:
+                data["model_mape_data"] = get_model_mape_data()
+                data["shap_beeswarm_dict"] = load_shap_beeswarm_from_gcs()
+                data["arc_diagram"] = load_image_from_gcs("arc_diagram.jpg")
+                data["max_cap"] = get_max_capacity()
+            
+            # Update session state with dynamic data
             for key, value in data.items():
                 st.session_state[key] = value
             
-            # Mark data as initialized
+            # Mark data as initialized and clear refresh flag
             st.session_state.data_initialized = True
+            if 'refresh_requested' in st.session_state:
+                del st.session_state.refresh_requested
 
 def render_taxi_availability_section():
     """Main function to render the taxi availability section"""
@@ -86,24 +104,34 @@ def render_taxi_availability_section():
     # Display region-specific recommendations
     st.markdown("### Region Forecasts")
 
+    # Make sure the map has a fixed key that doesn't change between sessions
+    if 'map_instance_id' not in st.session_state:
+        st.session_state.map_instance_id = 0
+
+    # Ensure map rendering state is initialized
+    if 'map_rendered' not in st.session_state:
+        st.session_state.map_rendered = False
+    
     map_container = st.container()
     with map_container:
+        # Create map using the updated function
         availability_map = create_singapore_availability_map(availability_data)
-    
-        # Add a unique, stable key and properly handle the return value
+        # Use st_folium with the right parameters
         folium_output = st_folium(
             availability_map, 
             width=600, 
             height=250,
             key=f"folium_map_{st.session_state.get('map_instance_id', 0)}",
-            returned_objects=[]  # Don't return any objects to reduce state changes 
+            returned_objects=[],
+            feature_group_to_add=None,
+            # These settings help prevent rerenders
+            center=None,
+            zoom=None
         )
-        
-        # Only update map state if user actually interacted with the map
-        if folium_output and 'last_active_drawing' in folium_output:
-            # Store that the map was interacted with, but don't trigger a rerender
-            if 'map_interaction' not in st.session_state:
-                st.session_state.map_interaction = {}
+        # Force rerender after initial load, to ensure map is displayed correctly
+        if not st.session_state.map_rendered:
+            st.session_state.map_rendered = True
+            st.rerun()
     
     # Filter out "All Regions" and sort remaining regions by Central, West, North, East
     region_data = availability_data[availability_data['region'] != 'All Regions'].copy()
@@ -162,8 +190,8 @@ def render_taxi_availability_section():
         **Absolute Score**: Ratio of forecasted taxis to maximum capacity (0-1 scale), indicating absolute availability.
 
         **Relative Score**: Transformed measure of how current forecast compares to typical baseline (0-1 scale).
-        
-        **Composite Score**: Combined score that balances absolute availability with relative comparison to determine recommendations.
+
+        **Composite Score**: Combined score that balances absolute availability (75% weightage) with relative comparison (25% weightage) to determine recommendations.
         """)
         
         st.caption("* Maximum capacity values are based on 99th percentile of historical observations for each region.")
@@ -399,9 +427,7 @@ if __name__ == "__main__":
     # Title and description
     st.title("🚕 Singapore Taxi Availability Forecast [BETA]")
     st.markdown("Real-time taxi availability with 2-hour forecasts by region. Note that this app is in beta and may have inaccurate forecasts due to limited training data. View project documentation and source code on [GitHub](https://github.com/heirloompotato/taxi-forecast).")
-    
-    # Initialize data if not already done
-    initialize_data_if_needed()
+
     # Calculate time since last refresh
     current_time = pd.Timestamp.utcnow().tz_convert('Asia/Singapore')
     if "last_refresh_time" not in st.session_state:
@@ -414,21 +440,13 @@ if __name__ == "__main__":
     refresh_col1, refresh_col2 = st.columns([3, 7])
     with refresh_col1:
         if minutes_since_refresh >= 5:
-            if st.button('🔄 Refresh All Data'):
-                # Update last refresh time
-                st.session_state.last_refresh_time = current_time
-                # Clear initialized flag to force reload
-                if "data_initialized" in st.session_state:
-                    del st.session_state.data_initialized
-                # Force rerun
-                st.rerun()
-            
-            # Define minutes_remaining for the other column
+            # Use on_click parameter to trigger the callback function
+            st.button('🔄 Refresh All Data', on_click=refresh_data, key="refresh_button")
             minutes_remaining = 0
         else:
             # Disabled button with countdown
             minutes_remaining = max(0, 5 - minutes_since_refresh)
-            st.button('🔄 Refresh All Data', disabled=True)
+            st.button('🔄 Refresh All Data', disabled=True, key="refresh_button_disabled")
 
     with refresh_col2:
         # Show when data was last updated
@@ -438,10 +456,13 @@ if __name__ == "__main__":
         if minutes_since_refresh >= 5:
             refresh_text += "Refresh available now</div>"
         else:
-            refresh_text += f"Next refresh available in {int(minutes_remaining)} minute(s)</div>"
+            refresh_text += f"Next refresh available in {min(int(minutes_remaining) + 1,5)} minute(s)</div>"
         
         st.markdown(refresh_text, unsafe_allow_html=True)
-        
+
+    # Initialize or refresh data where required
+    initialize_or_refresh_data()
+
     col1, col2 = st.columns([3, 2])
     with col1:
         render_taxi_availability_section()
