@@ -68,15 +68,18 @@ def _forecast_future_with_xgboost(models, xgb_df, features, prophet_base_forecas
         region_xgb_current_taxis = region_xgb_df['num_taxis'].values[0]
 
         region_forecast = region_prophet_df.copy()
-        num_timesteps = len(region_forecast)
+        # Extract start residual (at 5 min), to anchor first point to observed num_taxis
+        first_step_yhat = region_forecast.iloc[0]['yhat']
+        resid_5min = region_xgb_current_taxis - first_step_yhat
 
+        num_timesteps = len(region_forecast)
         if num_timesteps != 24:
             logging.warning(f"Expected 24 time steps but got {num_timesteps} for region {region}")
             continue
 
         # Define target residuals at horizon points (5-min intervals → 6 timesteps per 30 min)
         target_residuals = {
-            0: 0,               # Starting point (current time)
+            0: resid_5min,      # First 5 min point anchored to current observed value
             5: resid_0_5h,      # 0.5h 
             11: resid_1h,       # 1h
             17: resid_1_5h,     # 1.5h

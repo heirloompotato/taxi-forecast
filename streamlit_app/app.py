@@ -243,7 +243,6 @@ def plot_historical_w_forecast_taxis():
 
     st.plotly_chart(fig, use_container_width=True)
 
-@st.cache_data(ttl=60)
 def _generate_historical_w_forecast_taxis_plot(filtered_records_data, filtered_forecast_data):
     """Generate the plot for historical data with forecasted values"""
     fig = go.Figure()
