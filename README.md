@@ -1,7 +1,10 @@
-# Singapore Taxi Availability Forecast [BETA]
+# Singapore Taxi Availability Forecast
 
-This project is a real-time forecasting tool that estimates **2-hour future taxi availability across Singapore** using live location data and weather conditions. Built with a full GCP-based pipeline and visualized through an interactive Streamlit app, this tool aims to provide **insights into short-term mobility trends**. <br>
-🟢 Try the live beta app at [sgtaxiforecast.com](https://sgtaxiforecast.com)
+This project was a real-time forecasting tool that estimated **2-hour future taxi availability across Singapore** using live location data and weather conditions.
+Built with a full GCP-based pipeline and visualized through an interactive Streamlit app, this tool demonstrated how cloud infrastructure and ML can generate **short-term mobility insights**.
+
+⚠️ **Note**: The live beta app at [sgtaxiforecast.com](https://sgtaxiforecast.com) has been **decommissioned**.
+This repository now serves as a reference archive with the final architecture and demo.
 
 ## 🚕 Problem Statement & Business Relevance
 
@@ -14,8 +17,17 @@ This project is a real-time forecasting tool that estimates **2-hour future taxi
 
 This tool showcases how **open transport data** can be combined with **cloud infrastructure** and **machine learning** to produce actionable insights in a scalable and reproducible manner.
 
+## 📊 Demo & Architecture
+
+### System Architecture
+![System Architecture](docs/arc_diagram.jpg)
+
+### Dashboard Demo (1-min screen recording)
+<video src="docs/app_demo.mp4" controls width="600"></video>
+
 ## 📁 Project Structure
 ├── collector/ # Cloud Run job that pulls live taxi & weather data every 5 mins <br>
 ├── config/ # Configuration for regional/area mappings, time regressors and ML model <br>
 ├── etl/ # Flask-based ETL API for transforming and loading into BigQuery <br>
-├── streamlit_app/ # Frontend dashboard visualizing trends and forecast
+├── streamlit_app/ # Frontend dashboard visualizing trends and forecast <br>
+├── docs/ # System architecture and Dashboard demo
